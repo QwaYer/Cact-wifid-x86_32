@@ -11,7 +11,7 @@
  *
  * Запускается супервизором cgoct как /sbin/wifid.
  *
- * /etc/wifid.conf (все ключи необязательны):
+ * /etc/wifid.conf (все ключи необязательны; создаётся при первом запуске):
  *   file=/var/log/wifid.log
  *   console=0
  *   interval=5
@@ -30,6 +30,7 @@
 #include <poll.h>
 #include <dirent.h>
 
+#define CONFIG_PATH "/etc/wifid.conf"
 #define SOCK_PATH   "/run/wifid.sock"
 #define LOG_DEFAULT "/var/log/wifid.log"
 #define MAX_NODE    64
@@ -41,9 +42,36 @@ static int  out_fd        = -1;
 
 static char wifi_node[MAX_NODE] = ""; /* "" = беспроводных устройств нет */
 
+/* Конфиг по умолчанию: пишется при первом запуске, если файла ещё нет. */
+static const char default_config[] =
+    "# wifid config - auto-generated on first start.\n"
+    "#\n"
+    "# file     - журнал событий\n"
+    "# console  - дублировать на /dev/console (0|1)\n"
+    "# interval - период опроса /dev (сек)\n"
+    "\n"
+    "file=/var/log/wifid.log\n"
+    "console=0\n"
+    "interval=5\n";
+
+static void ensure_dir(const char *path) {
+    (void)mkdir(path, 0755);
+}
+
+static void config_write_default(void) {
+    int fd = open(CONFIG_PATH, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) return;
+    write(fd, default_config, sizeof(default_config) - 1);
+    close(fd);
+}
+
 static void config_load(void) {
-    FILE *f = fopen("/etc/wifid.conf", "r");
-    if (!f) return;
+    FILE *f = fopen(CONFIG_PATH, "r");
+    if (!f) {
+        config_write_default();
+        f = fopen(CONFIG_PATH, "r");
+        if (!f) return;
+    }
     char line[160];
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
@@ -188,6 +216,8 @@ int main(int argc, char *argv[]) {
 
     printf("wifid: starting\n");
     config_load();
+    ensure_dir("/var/log");
+    ensure_dir("/run");
 
     out_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (out_fd < 0) {
