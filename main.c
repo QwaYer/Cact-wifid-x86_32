@@ -1,17 +1,17 @@
 /*
- * wifid — демон беспроводных интерфейсов CactOS.
+ * wifid — wireless interface daemon for CactOS.
  *
- * Следит за появлением беспроводных устройств в devfs (имя содержит "wlan",
- * "wifi" или "wl") и держит AF_UNIX-сервис /run/wifid.sock для клиентов.
- * Беспроводной стек ядра (wlan/802.11) пока не реализован — узлы wlan* не
- * регистрируются, поэтому демон тихо ждёт появления такого узла.
+ * Watches for wireless devices appearing in devfs (name contains "wlan",
+ * "wifi" or "wl") and keeps the AF_UNIX service /run/wifid.sock for clients.
+ * The kernel wireless stack (wlan/802.11) is not implemented yet — wlan* nodes
+ * are not registered, so the daemon silently waits for such a node to appear.
  *
- * Протокол (одна строка за соединение):
- *   status -> "wifi=none\n" или "wifi=present path=/dev/<node>\n"
+ * Protocol (one line per connection):
+ *   status -> "wifi=none\n" or "wifi=present path=/dev/<node>\n"
  *
- * Запускается супервизором cgoct как /sbin/wifid.
+ * Started by the cgoct supervisor as /sbin/wifid.
  *
- * /etc/wifid.conf (все ключи необязательны; создаётся при первом запуске):
+ * /etc/wifid.conf (all keys optional; created on first start):
  *   file=/var/log/wifid.log
  *   console=0
  *   interval=5
@@ -40,15 +40,15 @@ static int  console_on    = 0;
 static int  interval_sec  = 5;
 static int  out_fd        = -1;
 
-static char wifi_node[MAX_NODE] = ""; /* "" = беспроводных устройств нет */
+static char wifi_node[MAX_NODE] = ""; /* "" = no wireless devices */
 
-/* Конфиг по умолчанию: пишется при первом запуске, если файла ещё нет. */
+/* Default config: written on first start if the file does not exist yet. */
 static const char default_config[] =
     "# wifid config - auto-generated on first start.\n"
     "#\n"
-    "# file     - журнал событий\n"
-    "# console  - дублировать на /dev/console (0|1)\n"
-    "# interval - период опроса /dev (сек)\n"
+    "# file     - event log\n"
+    "# console  - duplicate to /dev/console (0|1)\n"
+    "# interval - /dev poll period (sec)\n"
     "\n"
     "file=/var/log/wifid.log\n"
     "console=0\n"
@@ -118,7 +118,7 @@ static int is_wifi_name(const char *nm) {
             strstr(nm, "wl") != 0);
 }
 
-/* Обновить wifi_node; вернуть 1, если состояние изменилось. */
+/* Update wifi_node; return 1 if the state changed. */
 static int scan_wifi(void) {
     char found[MAX_NODE] = "";
     int fd = open("/dev", O_RDONLY);
