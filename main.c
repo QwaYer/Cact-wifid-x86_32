@@ -29,6 +29,8 @@
 #include <socket.h>
 #include <poll.h>
 #include <dirent.h>
+#include <wait.h>
+#include <wlan.h>
 
 #define CONFIG_PATH "/etc/wifid.conf"
 #define SOCK_PATH   "/run/wifid.sock"
@@ -42,17 +44,29 @@ static int  out_fd        = -1;
 
 static char wifi_node[MAX_NODE] = ""; /* "" = no wireless devices */
 
+/* Connection profile and the wljoin helper.  wifid is the initiator: it runs
+ * wljoin to join the configured network, and runs it again whenever the link
+ * drops on its own. */
+static char  cfg_ssid[33] = "";
+static char  cfg_pass[64] = "";
+static pid_t wljoin_pid   = -1;
+static char *spawn_envp[] = { "PATH=/usr/bin:/usr/sbin", "HOME=/", NULL };
+
 /* Default config: written on first start if the file does not exist yet. */
 static const char default_config[] =
     "# wifid config - auto-generated on first start.\n"
     "#\n"
-    "# file     - event log\n"
-    "# console  - duplicate to /dev/console (0|1)\n"
-    "# interval - /dev poll period (sec)\n"
+    "# file       - event log\n"
+    "# console    - duplicate to /dev/console (0|1)\n"
+    "# interval   - /dev poll period (sec)\n"
+    "# ssid       - network to join (empty = do not connect)\n"
+    "# passphrase - WPA2 passphrase (empty = open network)\n"
     "\n"
     "file=/var/log/wifid.log\n"
     "console=0\n"
-    "interval=5\n";
+    "interval=5\n"
+    "#ssid=MyNetwork\n"
+    "#passphrase=secret\n";
 
 static void ensure_dir(const char *path) {
     (void)mkdir(path, 0755);
@@ -95,6 +109,12 @@ static void config_load(void) {
         } else if (strcmp(key, "interval") == 0) {
             int v = atoi(val);
             if (v >= 1 && v <= 3600) interval_sec = v;
+        } else if (strcmp(key, "ssid") == 0) {
+            strncpy(cfg_ssid, val, sizeof(cfg_ssid) - 1);
+            cfg_ssid[sizeof(cfg_ssid) - 1] = '\0';
+        } else if (strcmp(key, "passphrase") == 0) {
+            strncpy(cfg_pass, val, sizeof(cfg_pass) - 1);
+            cfg_pass[sizeof(cfg_pass) - 1] = '\0';
         }
     }
     fclose(f);
@@ -152,6 +172,64 @@ static int scan_wifi(void) {
     return 1;
 }
 
+/* Link state from the driver: 1 up, 0 down, -1 unknown (no node / no ioctl). */
+static int wlan_link_state(void) {
+    char path[48];
+    cact_wlan_status_t st;
+    int fd, r;
+
+    if (wifi_node[0] == '\0')
+        return -1;
+    snprintf(path, sizeof(path), "/dev/%s", wifi_node);
+    fd = open(path, O_RDWR);
+    if (fd < 0)
+        return -1;
+    r = wl_status(fd, &st);
+    close(fd);
+    if (r != 0)
+        return -1;
+    return st.linked ? 1 : 0;
+}
+
+/* Reap a finished wljoin and log whether the join succeeded. */
+static void reap_wljoin(void) {
+    int status = 0;
+    char line[96];
+
+    if (wljoin_pid <= 0)
+        return;
+    if (waitpid(wljoin_pid, &status, WNOHANG) != wljoin_pid)
+        return;
+    snprintf(line, sizeof(line), "wifid: wljoin finished (%s)\n",
+             WIFEXITED(status) && WEXITSTATUS(status) == 0 ? "connected"
+                                                           : "failed");
+    log_event(line);
+    printf("%s", line);
+    wljoin_pid = -1;
+}
+
+/* Run /sbin/wljoin for the configured profile, unless it is already running. */
+static void start_wljoin(void) {
+    char line[128];
+    pid_t pid;
+
+    if (wljoin_pid > 0 || cfg_ssid[0] == '\0')
+        return;
+
+    snprintf(line, sizeof(line), "wifid: joining '%s' ...\n", cfg_ssid);
+    log_event(line);
+    printf("%s", line);
+
+    pid = fork();
+    if (pid == 0) {
+        char *argv[] = { "wljoin", cfg_ssid, cfg_pass, NULL };
+        execve("/usr/sbin/wljoin", argv, spawn_envp);
+        _exit(127);
+    }
+    if (pid > 0)
+        wljoin_pid = pid;
+}
+
 static void handle_client(int cl) {
     char req[64];
     char b;
@@ -167,11 +245,13 @@ static void handle_client(int cl) {
     req[got] = '\0';
 
     if (strcmp(req, "status") == 0) {
-        char resp[160];
+        char resp[192];
         if (wifi_node[0] == '\0') {
             snprintf(resp, sizeof(resp), "wifi=none\n");
         } else {
-            snprintf(resp, sizeof(resp), "wifi=present path=/dev/%s\n", wifi_node);
+            int st = wlan_link_state();
+            snprintf(resp, sizeof(resp), "wifi=present path=/dev/%s link=%s\n",
+                     wifi_node, st == 1 ? "up" : st == 0 ? "down" : "unknown");
         }
         send(cl, resp, (uint32_t)strlen(resp), 0);
         log_event("wifid: status requested\n");
@@ -225,6 +305,13 @@ int main(int argc, char *argv[]) {
     }
     log_event("wifid: starting\n");
 
+    if (cfg_ssid[0]) {
+        char line[96];
+        snprintf(line, sizeof(line), "wifid: profile '%s'\n", cfg_ssid);
+        log_event(line);
+        printf("%s", line);
+    }
+
     scan_wifi();
 
     int srv = -1;
@@ -261,6 +348,14 @@ int main(int argc, char *argv[]) {
 
         if (mono_ms() >= next_scan) {
             scan_wifi();
+            reap_wljoin();
+
+            /* wifid is the initiator: join the configured network, and re-join
+             * when the link dropped on its own (st == 0 after having been up). */
+            int st = wlan_link_state();
+            if (st == 0)
+                start_wljoin();
+
             next_scan = mono_ms() + interval_sec * 1000L;
         }
     }
